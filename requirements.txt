@@ -1,0 +1,26 @@
+# ── Microsoft Agent Framework ─────────────────────────────────────────────────
+agent-framework-core>=1.0.0
+agent-framework-foundry>=1.0.0
+
+# ── Azure SDKs ────────────────────────────────────────────────────────────────
+azure-ai-projects>=1.0.0
+azure-identity>=1.19.0
+azure-search-documents>=11.6.0
+azure-monitor-opentelemetry>=1.6.0   # optional — App Insights
+
+# ── Azure Cosmos DB ───────────────────────────────────────────────────────────
+azure-cosmos>=4.7.0                  # data-plane: containers, queries, upserts
+azure-mgmt-cosmosdb>=9.4.0           # management-plane: provision_cosmos.py only
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+openai>=1.51.0
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.27.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv>=1.0.0
