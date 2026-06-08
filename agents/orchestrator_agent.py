@@ -140,8 +140,10 @@ async def orchestrator_workflow(user_query: UserQuery) -> FinalResponse:
             )
 
         logger.warning(
-            "orchestrator attempt=%d confidence=%.3f below threshold=%.2f",
+            "orchestrator attempt=%d FAILED threshold — confidence=%.3f < threshold=%.2f "
+            "tool=%s answer_snippet='%.120s'",
             attempt, result.confidence, settings.CONFIDENCE_THRESHOLD,
+            tool, result.answer.replace("\n", " "),
         )
 
     logger.error("orchestrator FAILED after %d attempts", settings.MAX_RETRIEVAL_ATTEMPTS)

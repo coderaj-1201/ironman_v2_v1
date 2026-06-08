@@ -16,6 +16,9 @@ def configure_logging() -> None:
         level=level,
         format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}',
     )
+    # To see retrieval diagnostics (chunks pulled, scores, raw LLM output):
+    #   set LOG_LEVEL=DEBUG in .env
+    # WARNING: DEBUG logs are verbose — use only when diagnosing retrieval failures.
 
     if settings.APPLICATIONINSIGHTS_CONNECTION_STRING:
         try:

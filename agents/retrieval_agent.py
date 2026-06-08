@@ -124,6 +124,11 @@ async def synthesize_answer(
     )
 
     full_text = resp.choices[0].message.content.strip()
+
+    # ── DEBUG: raw LLM output before parsing ─────────────────────────────────
+    logger.debug("synthesize_answer raw LLM output: '%s'", full_text.replace("\n", "\\n"))
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         split_idx = full_text.rfind("\n{")
         if split_idx == -1:
@@ -150,14 +155,32 @@ async def synthesize_answer(
 @workflow(name="retrieval_workflow")
 async def retrieval_workflow(request: OrchestratorRequest) -> RetrievalResult:
     logger.info(
-        "retrieval attempt=%d domain=%s tool=%s",
-        request.attempt, request.domain, request.tool,
+        "retrieval attempt=%d domain=%s tool=%s query='%.80s'",
+        request.attempt, request.domain, request.tool, request.query,
     )
 
     match request.tool:
         case "hyde":          docs = await run_hyde(request.query, request.domain)
         case "decomposition": docs = await run_decomposition(request.query, request.domain)
         case _:               docs = await run_hybrid(request.query, request.domain)
+
+    # ── DEBUG: log every chunk pulled from search ─────────────────────────────
+    if not docs:
+        logger.warning(
+            "retrieval attempt=%d tool=%s returned ZERO chunks for domain=%s query='%.80s'",
+            request.attempt, request.tool, request.domain, request.query,
+        )
+    else:
+        logger.debug(
+            "retrieval attempt=%d tool=%s pulled %d chunks:",
+            request.attempt, request.tool, len(docs),
+        )
+        for i, d in enumerate(docs):
+            logger.debug(
+                "  chunk[%d] id=%s score=%.4f source='%s' type=%s content='%.100s'",
+                i, d.id, d.score, d.source, d.chunk_type, d.content.replace("\n", " "),
+            )
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Parent-child: fetch parent chunks for context enrichment
     parent_ids  = list({d.parent_id for d in docs if d.parent_id})
@@ -168,12 +191,34 @@ async def retrieval_workflow(request: OrchestratorRequest) -> RetrievalResult:
             parent_docs.append(parent)
     all_docs = docs + [p for p in parent_docs if p.id not in {d.id for d in docs}]
 
+    # ── DEBUG: log parent enrichment ──────────────────────────────────────────
+    if parent_docs:
+        logger.debug(
+            "retrieval attempt=%d parent enrichment: %d parents fetched for %d child chunks",
+            request.attempt, len(parent_docs), len(docs),
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Pass conversation_id so synthesize_answer can inject short-term memory
     answer, confidence, source_docs = await synthesize_answer(
         request.query, all_docs, conversation_id=request.conversation_id
     )
 
-    logger.info("retrieval complete confidence=%.3f", confidence)
+    # ── DEBUG: log synthesis result ───────────────────────────────────────────
+    logger.debug(
+        "retrieval attempt=%d synthesis: confidence=%.3f threshold=%.2f passed=%s answer='%.120s'",
+        request.attempt, confidence, settings.CONFIDENCE_THRESHOLD,
+        confidence >= settings.CONFIDENCE_THRESHOLD,
+        answer.replace("\n", " "),
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    logger.info(
+        "retrieval complete attempt=%d confidence=%.3f passed=%s chunks_used=%d",
+        request.attempt, confidence,
+        confidence >= settings.CONFIDENCE_THRESHOLD,
+        len(all_docs),
+    )
 
     return RetrievalResult(
         query=request.query,
