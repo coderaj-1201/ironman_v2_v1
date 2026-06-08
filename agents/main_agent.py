@@ -229,19 +229,24 @@ async def handle_connect_sme(user_id: str) -> str:
 
 
 @workflow(name="main_agent_workflow")
-async def main_agent_workflow(user_query: UserQuery) -> str:
+async def main_agent_workflow(user_query: UserQuery) -> tuple[str, FinalResponse | None]:
+    """
+    Returns (reply_string, FinalResponse | None).
+    reply_string  — formatted text for display (Teams / chat UI).
+    FinalResponse — structured data for API consumers; None for ticket/sme flows.
+    """
     text = user_query.text.strip().lower()
 
     if text == "raise_ticket":
-        return await handle_raise_ticket(user_query.user_id)
+        return await handle_raise_ticket(user_query.user_id), None
     if text == "connect_sme":
-        return await handle_connect_sme(user_query.user_id)
+        return await handle_connect_sme(user_query.user_id), None
 
     try:
         final: FinalResponse = await call_orchestrator(user_query)
     except Exception as exc:
         logger.error("Orchestrator call failed: %s", exc, exc_info=True)
-        return _FAILURE_MSG
+        return _FAILURE_MSG, None
 
     if final.status == "success":
         sources_text = ""
@@ -250,9 +255,10 @@ async def main_agent_workflow(user_query: UserQuery) -> str:
             sources_text = f"\n\n📚 **Sources:**\n{bullets}"
         meta = (f"*Domain: {final.domain.upper() if final.domain else 'N/A'} | "
                 f"Confidence: {final.confidence:.0%} | Attempts: {final.attempts_used}*")
-        return f"{final.answer}{sources_text}\n\n{meta}"
+        reply = f"{final.answer}{sources_text}\n\n{meta}"
+        return reply, final
 
-    return _FAILURE_MSG
+    return _FAILURE_MSG, final
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -287,16 +293,32 @@ async def query(raw: Request) -> Response:
 
     result_obj = await main_agent_workflow.run(user_query)
     outputs    = result_obj.get_outputs()
-    reply: str = outputs[0] if outputs else _FAILURE_MSG
 
-    # Extract metadata (ticket/sme flows have no domain/confidence)
+    # Unpack (reply, FinalResponse | None) tuple from refactored workflow
+    if outputs and isinstance(outputs[0], tuple):
+        reply, final = outputs[0]
+    else:
+        reply, final = _FAILURE_MSG, None
+
+    # Derive structured fields — use FinalResponse directly, no regex needed
     text_lower = user_query.text.strip().lower()
     if text_lower in ("raise_ticket", "connect_sme"):
-        domain, confidence, attempts, status = None, 0.0, 0, "success"
+        domain, confidence, attempts_used, status, sources, answer = (
+            None, 0.0, 0, "success", [], reply
+        )
+    elif final is not None:
+        domain        = final.domain
+        confidence    = final.confidence
+        attempts_used = final.attempts_used
+        status        = final.status
+        sources       = final.sources
+        answer        = final.answer       # clean answer text without footer
     else:
-        domain, confidence, attempts, status = _parse_meta_from_reply(reply)
+        # orchestrator unreachable — regex fallback
+        domain, confidence, attempts_used, status = _parse_meta_from_reply(reply)
+        sources, answer = [], reply
 
-    # Persist to Cosmos (fire-and-forget — response is not blocked)
+    # Persist to Cosmos (fire-and-forget — response not blocked)
     turn_doc = {
         "id":              question_id,   # Cosmos requires 'id'
         "question_id":     question_id,
@@ -304,10 +326,10 @@ async def query(raw: Request) -> Response:
         "conversation_id": user_query.conversation_id,
         "user_id":         user_query.user_id,
         "question":        user_query.text,
-        "answer":          reply,
+        "answer":          answer,
         "domain":          domain,
         "confidence":      confidence,
-        "attempts_used":   attempts,
+        "attempts_used":   attempts_used,
         "status":          status,
         "created_at":      _utc_now(),
     }
@@ -315,10 +337,19 @@ async def query(raw: Request) -> Response:
 
     return Response(
         content=json.dumps({
-            "reply":           reply,
-            "question_id":     question_id,
-            "answer_id":       answer_id,
+            # ── Display ───────────────────────────────────────────────────────
+            "reply":          reply,          # full formatted string for UI / Teams
+            # ── Identity ─────────────────────────────────────────────────────
+            "question_id":    question_id,
+            "answer_id":      answer_id,
             "conversation_id": user_query.conversation_id,
+            # ── Structured fields ─────────────────────────────────────────────
+            "answer":         answer,         # clean answer text, no footer
+            "domain":         domain,
+            "confidence":     confidence,
+            "attempts_used":  attempts_used,
+            "status":         status,
+            "sources":        sources,        # list of {title, excerpt, url, relevance}
         }),
         media_type="application/json",
     )
