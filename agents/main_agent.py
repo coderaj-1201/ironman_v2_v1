@@ -4,31 +4,65 @@ Main Agent — Local Dev
 MAF Functional Workflow (@workflow / @step).
 Entry point for all queries. Calls Orchestrator via HTTP.
 
-Changes vs original:
-  - /query endpoint: generates question_id, returns structured response with
-    separate fields: reply, answer_id, question_id, conversation_id,
-    confidence, sources, domain, attempts_used, status.
-  - After a successful answer: saves conversation turn to Cosmos (fire-and-forget).
-  - After a successful answer: extracts + saves long-term memory (fire-and-forget).
-  - NEW /feedback  POST endpoint.
-  - NEW /history   GET  endpoint.
-  - NEW /memory    GET  endpoint.
-  - Workflow now returns dict (was str) so all FinalResponse fields are preserved.
+Chat history and feedback are persisted to Azure Cosmos DB.
+
+ID scheme
+---------
+  question_id : qst-<8 hex>   — unique per user message, stored on the turn
+  answer_id   : ans-<8 hex>   — unique per synthesised answer, links feedback → turn
+
+Cosmos containers
+-----------------
+  chat_history  (partition key: /conversation_id)
+      id                = question_id          ← Cosmos document id
+      question_id       = same as id
+      answer_id         = ans-<hex>
+      conversation_id   = ...
+      user_id           = ...
+      question          = user text
+      answer            = agent reply
+      domain            = hr | legal | it | null
+      confidence        = float
+      attempts_used     = int
+      status            = success | failure
+      created_at        = ISO-8601 UTC
+
+  feedback  (partition key: /answer_id)
+      id          = feedback_id               ← Cosmos document id
+      feedback_id = same as id
+      answer_id   = ans-<hex>
+      question_id = qst-<hex>                 ← back-link to the turn
+      conversation_id, user_id, rating, comment, created_at
+
+Endpoints
+---------
+  POST /query
+  GET  /history/{conversation_id}?page=1&page_size=20
+  POST /feedback
+  GET  /feedback/{answer_id}
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Literal
 
 import httpx
 import uvicorn
 from agent_framework import step, workflow
-from fastapi import BackgroundTasks, FastAPI, Request, Response
+from azure.cosmos.exceptions import CosmosHttpResponseError
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from pydantic import BaseModel
 
+from shared.azure_clients import get_chat_history_container, get_feedback_container
+from shared.config import settings
 from shared.logging_config import configure_logging, get_logger
-from shared.models import FeedbackRequest, FinalResponse, UserQuery
+from shared.models import FinalResponse, UserQuery
 
 configure_logging()
 logger = get_logger(__name__)
@@ -42,15 +76,140 @@ _FAILURE_MSG = (
 )
 
 
-# ── MAF steps — unchanged from original ──────────────────────────────────────
+# ── ID generators ─────────────────────────────────────────────────────────────
+
+def new_question_id() -> str:
+    return f"qst-{uuid.uuid4().hex[:8]}"
+
+def new_answer_id() -> str:
+    return f"ans-{uuid.uuid4().hex[:8]}"
+
+def new_feedback_id() -> str:
+    return f"fb-{uuid.uuid4().hex[:10]}"
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Pydantic API models ───────────────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    answer_id: str
+    question_id: str
+    conversation_id: str
+    user_id: str
+    rating: Literal["up", "down"]
+    comment: str | None = None
+
+class FeedbackResponse(BaseModel):
+    feedback_id: str
+    answer_id: str
+    question_id: str
+    conversation_id: str
+    user_id: str
+    rating: str
+    comment: str | None
+    created_at: str
+
+class HistoryResponse(BaseModel):
+    conversation_id: str
+    total: int
+    page: int
+    page_size: int
+    turns: list[dict]
+
+
+# ── Cosmos helpers (run in thread — SDK is sync) ──────────────────────────────
+
+def _upsert_chat_turn(doc: dict) -> None:
+    try:
+        get_chat_history_container().upsert_item(doc)
+        logger.info(
+            "cosmos chat_history saved question_id=%s answer_id=%s",
+            doc["question_id"], doc["answer_id"],
+        )
+    except CosmosHttpResponseError as exc:
+        logger.error("cosmos chat_history write failed: %s", exc, exc_info=True)
+        raise
+
+
+def _upsert_feedback(doc: dict) -> None:
+    try:
+        get_feedback_container().upsert_item(doc)
+        logger.info("cosmos feedback saved feedback_id=%s answer_id=%s", doc["id"], doc["answer_id"])
+    except CosmosHttpResponseError as exc:
+        logger.error("cosmos feedback write failed: %s", exc, exc_info=True)
+        raise
+
+
+def _query_chat_history(conversation_id: str, offset: int, limit: int) -> tuple[list[dict], int]:
+    """Returns (page_of_turns, total_count). Ordered by _ts ASC (insertion order)."""
+    container = get_chat_history_container()
+
+    total = list(container.query_items(
+        query="SELECT VALUE COUNT(1) FROM c WHERE c.conversation_id = @cid",
+        parameters=[{"name": "@cid", "value": conversation_id}],
+        partition_key=conversation_id,
+    ))
+    total_count: int = total[0] if total else 0
+
+    items = list(container.query_items(
+        query=(
+            "SELECT * FROM c WHERE c.conversation_id = @cid "
+            "ORDER BY c._ts ASC OFFSET @offset LIMIT @limit"
+        ),
+        parameters=[
+            {"name": "@cid",    "value": conversation_id},
+            {"name": "@offset", "value": offset},
+            {"name": "@limit",  "value": limit},
+        ],
+        partition_key=conversation_id,
+    ))
+    return items, total_count
+
+
+def _get_feedback_by_answer(answer_id: str) -> dict | None:
+    try:
+        items = list(get_feedback_container().query_items(
+            query="SELECT * FROM c WHERE c.answer_id = @aid",
+            parameters=[{"name": "@aid", "value": answer_id}],
+            partition_key=answer_id,
+        ))
+        return items[0] if items else None
+    except CosmosHttpResponseError:
+        return None
+
+
+# ── Meta extraction from formatted reply ─────────────────────────────────────
+
+def _parse_meta_from_reply(reply: str) -> tuple[str | None, float, int, str]:
+    """Extract (domain, confidence, attempts, status) from the footer injected by workflow."""
+    domain: str | None = None
+    confidence: float = 0.0
+    attempts: int = 0
+    status = "failure"
+
+    m_domain = re.search(r"Domain:\s*(\w+)", reply)
+    m_conf   = re.search(r"Confidence:\s*(\d+)%", reply)
+    m_att    = re.search(r"Attempts:\s*(\d+)", reply)
+
+    if m_domain:
+        domain = m_domain.group(1).lower()
+        status = "success"
+    if m_conf:
+        confidence = int(m_conf.group(1)) / 100.0
+    if m_att:
+        attempts = int(m_att.group(1))
+
+    return domain, confidence, attempts, status
+
+
+# ── MAF steps / workflow ──────────────────────────────────────────────────────
 
 @step
 async def call_orchestrator(user_query: UserQuery) -> FinalResponse:
     async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{_ORCHESTRATOR_URL}/orchestrate",
-            json=user_query.__dict__,
-        )
+        resp = await client.post(f"{_ORCHESTRATOR_URL}/orchestrate", json=user_query.__dict__)
         resp.raise_for_status()
         return FinalResponse(**resp.json())
 
@@ -59,10 +218,8 @@ async def call_orchestrator(user_query: UserQuery) -> FinalResponse:
 async def handle_raise_ticket(user_id: str) -> str:
     ticket_id = f"TKT-{uuid.uuid4().hex[:8].upper()}"
     logger.info("Ticket raised ticket_id=%s user_id=%s", ticket_id, user_id)
-    return (
-        f"✅ **Ticket raised!** Reference: `{ticket_id}`\n"
-        f"Expected response: **4 business hours**."
-    )
+    return (f"✅ **Ticket raised!** Reference: `{ticket_id}`\n"
+            f"Expected response: **4 business hours**.")
 
 
 @step
@@ -71,105 +228,37 @@ async def handle_connect_sme(user_id: str) -> str:
     return "✅ **Connecting you with an SME.** Expected response: **2 business hours**."
 
 
-# ── MAF workflow ──────────────────────────────────────────────────────────────
-# Returns a dict so the /query endpoint can expose all fields separately.
-# Special commands (raise_ticket, connect_sme) return a minimal dict with
-# only reply + status so callers don't need to branch on response shape.
-
 @workflow(name="main_agent_workflow")
-async def main_agent_workflow(user_query: UserQuery) -> dict:
+async def main_agent_workflow(user_query: UserQuery) -> str:
     text = user_query.text.strip().lower()
 
     if text == "raise_ticket":
-        reply = await handle_raise_ticket(user_query.user_id)
-        return {"status": "action", "reply": reply,
-                "answer_id": "", "confidence": None,
-                "sources": [], "domain": None, "attempts_used": 0}
-
+        return await handle_raise_ticket(user_query.user_id)
     if text == "connect_sme":
-        reply = await handle_connect_sme(user_query.user_id)
-        return {"status": "action", "reply": reply,
-                "answer_id": "", "confidence": None,
-                "sources": [], "domain": None, "attempts_used": 0}
+        return await handle_connect_sme(user_query.user_id)
 
     try:
         final: FinalResponse = await call_orchestrator(user_query)
     except Exception as exc:
         logger.error("Orchestrator call failed: %s", exc, exc_info=True)
-        return {"status": "failure", "reply": _FAILURE_MSG,
-                "answer_id": "", "confidence": None,
-                "sources": [], "domain": None, "attempts_used": 0}
+        return _FAILURE_MSG
 
     if final.status == "success":
-        return {
-            "status":        "success",
-            "reply":         final.answer,
-            "answer_id":     final.answer_id,
-            "confidence":    final.confidence,
-            "sources":       final.sources,
-            "domain":        str(final.domain).upper() if final.domain else None,
-            "attempts_used": final.attempts_used,
-            # carry FinalResponse for persistence — stripped before JSON response
-            "_final":        final,
-        }
+        sources_text = ""
+        if final.sources:
+            bullets = "\n".join(f"  • {s.get('title', s.get('source', ''))}" for s in final.sources)
+            sources_text = f"\n\n📚 **Sources:**\n{bullets}"
+        meta = (f"*Domain: {final.domain.upper() if final.domain else 'N/A'} | "
+                f"Confidence: {final.confidence:.0%} | Attempts: {final.attempts_used}*")
+        return f"{final.answer}{sources_text}\n\n{meta}"
 
-    return {"status": "failure", "reply": _FAILURE_MSG,
-            "answer_id": "", "confidence": None,
-            "sources": [], "domain": None, "attempts_used": 0}
-
-
-async def _persist_turn(user_query: UserQuery, final: FinalResponse) -> None:
-    """
-    Saves conversation turn + extracts long-term memory facts.
-    Runs as a FastAPI BackgroundTask after the response is sent.
-    Any failure is logged but never surfaced to the user.
-    """
-    try:
-        from shared.conversation_store import async_save_turn
-        await async_save_turn(
-            question_id=user_query.question_id,
-            answer_id=final.answer_id,
-            conversation_id=user_query.conversation_id,
-            user_id=user_query.user_id,
-            query=user_query.text,
-            answer=final.answer,
-            domain=str(final.domain) if final.domain else "",
-            confidence=final.confidence,
-            sources=final.sources,
-        )
-    except Exception as exc:
-        logger.warning("_persist_turn: save_turn failed (non-fatal): %s", exc)
-
-    # Memory extraction runs sequentially after turn save — we're already
-    # in a background task so no need for another create_task layer.
-    try:
-        from shared.memory_store import async_extract_and_save_long_term
-        await async_extract_and_save_long_term(
-            user_id=user_query.user_id,
-            query=user_query.text,
-            answer=final.answer,
-            source_question_id=user_query.question_id,
-        )
-    except Exception as exc:
-        logger.warning("_persist_turn: memory extraction failed (non-fatal): %s", exc)
+    return _FAILURE_MSG
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Initialise Cosmos DB connection at startup — ensures containers exist
-    # and warms up the lru_cache so first request has no cold-start penalty.
-    try:
-        from shared.azure_clients import get_cosmos_database
-        db = await asyncio.to_thread(get_cosmos_database)
-        if db is not None:
-            logger.info("Main Agent: Cosmos DB initialised — database='%s'", db.id)
-        else:
-            logger.warning("Main Agent: Cosmos DB not configured — storage features disabled.")
-    except Exception as exc:
-        logger.warning("Main Agent: Cosmos DB init failed (non-fatal): %s", exc)
-
     logger.info("Main Agent started.")
     yield
     logger.info("Main Agent stopped.")
@@ -184,153 +273,131 @@ async def health() -> dict:
 
 
 @app.post("/query")
-async def query(raw: Request, background_tasks: BackgroundTasks) -> Response:
+async def query(raw: Request) -> Response:
     body = await raw.json()
-
-    # Validate required field
-    if not body.get("text"):
-        return Response(
-            content=json.dumps({"error": "'text' field is required"}),
-            status_code=400,
-            media_type="application/json",
-        )
-
     user_query = UserQuery(
         text=body["text"],
         conversation_id=body.get("conversation_id", str(uuid.uuid4())),
         user_id=body.get("user_id", "anonymous"),
-        question_id=body.get("question_id", f"q-{uuid.uuid4().hex[:8]}"),
     )
+
+    # Generate IDs before workflow runs
+    question_id = new_question_id()
+    answer_id   = new_answer_id()
+
     result_obj = await main_agent_workflow.run(user_query)
     outputs    = result_obj.get_outputs()
+    reply: str = outputs[0] if outputs else _FAILURE_MSG
 
-    out: dict = outputs[0] if outputs else {
-        "status": "failure", "reply": _FAILURE_MSG,
-        "answer_id": "", "confidence": None,
-        "sources": [], "domain": None, "attempts_used": 0,
+    # Extract metadata (ticket/sme flows have no domain/confidence)
+    text_lower = user_query.text.strip().lower()
+    if text_lower in ("raise_ticket", "connect_sme"):
+        domain, confidence, attempts, status = None, 0.0, 0, "success"
+    else:
+        domain, confidence, attempts, status = _parse_meta_from_reply(reply)
+
+    # Persist to Cosmos (fire-and-forget — response is not blocked)
+    turn_doc = {
+        "id":              question_id,   # Cosmos requires 'id'
+        "question_id":     question_id,
+        "answer_id":       answer_id,
+        "conversation_id": user_query.conversation_id,
+        "user_id":         user_query.user_id,
+        "question":        user_query.text,
+        "answer":          reply,
+        "domain":          domain,
+        "confidence":      confidence,
+        "attempts_used":   attempts,
+        "status":          status,
+        "created_at":      _utc_now(),
+    }
+    asyncio.create_task(asyncio.to_thread(_upsert_chat_turn, turn_doc))
+
+    return Response(
+        content=json.dumps({
+            "reply":           reply,
+            "question_id":     question_id,
+            "answer_id":       answer_id,
+            "conversation_id": user_query.conversation_id,
+        }),
+        media_type="application/json",
+    )
+
+
+# ── Chat history endpoint ─────────────────────────────────────────────────────
+
+@app.get("/history/{conversation_id}", response_model=HistoryResponse)
+async def get_history(
+    conversation_id: str,
+    page: int      = Query(default=1,  ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    offset = (page - 1) * page_size
+    try:
+        turns, total = await asyncio.to_thread(
+            _query_chat_history, conversation_id, offset, page_size
+        )
+    except CosmosHttpResponseError as exc:
+        logger.error("cosmos history read failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not read chat history from Cosmos DB.")
+
+    if not turns and page == 1:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return HistoryResponse(
+        conversation_id=conversation_id,
+        total=total,
+        page=page,
+        page_size=page_size,
+        turns=turns,
+    )
+
+
+# ── Feedback endpoints ────────────────────────────────────────────────────────
+
+@app.post("/feedback", response_model=FeedbackResponse, status_code=201)
+async def submit_feedback(req: FeedbackRequest):
+    existing = await asyncio.to_thread(_get_feedback_by_answer, req.answer_id)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Feedback already submitted for answer_id={req.answer_id}.",
+        )
+
+    feedback_id = new_feedback_id()
+    doc = {
+        "id":              feedback_id,
+        "feedback_id":     feedback_id,
+        "answer_id":       req.answer_id,
+        "question_id":     req.question_id,
+        "conversation_id": req.conversation_id,
+        "user_id":         req.user_id,
+        "rating":          req.rating,
+        "comment":         req.comment,
+        "created_at":      _utc_now(),
     }
 
-    # Cosmos persistence via FastAPI BackgroundTasks — safe regardless of MAF internals
-    # BackgroundTasks runs after the response is sent, in the same event loop.
-    final: FinalResponse | None = out.pop("_final", None)
-    if final is not None:
-        background_tasks.add_task(_persist_turn, user_query, final)
-
-    return Response(
-        content=json.dumps({
-            "question_id":     user_query.question_id,
-            "answer_id":       out.get("answer_id", ""),
-            "conversation_id": user_query.conversation_id,
-            "user_id":         user_query.user_id,
-            "status":          out.get("status", "failure"),
-            "reply":           out.get("reply", _FAILURE_MSG),
-            "domain":          out.get("domain"),
-            "confidence":      out.get("confidence"),
-            "attempts_used":   out.get("attempts_used", 0),
-            "sources":         out.get("sources", []),
-        }),
-        media_type="application/json",
-    )
-
-
-@app.post("/feedback")
-async def feedback(raw: Request) -> Response:
-    """
-    POST /feedback
-    Body: { answer_id, question_id, user_id, rating (1-5), comment? }
-    """
-    body = await raw.json()
     try:
-        fb = FeedbackRequest(
-            answer_id=body["answer_id"],
-            question_id=body.get("question_id", ""),
-            user_id=body.get("user_id", "anonymous"),
-            rating=int(body["rating"]),
-            comment=body.get("comment", ""),
-        )
-    except (KeyError, ValueError) as exc:
-        return Response(
-            content=json.dumps({"error": f"Invalid payload: {exc}"}),
-            status_code=400,
-            media_type="application/json",
-        )
+        await asyncio.to_thread(_upsert_feedback, doc)
+    except CosmosHttpResponseError as exc:
+        logger.error("cosmos feedback write error: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not save feedback to Cosmos DB.")
 
+    return FeedbackResponse(**doc)
+
+
+@app.get("/feedback/{answer_id}", response_model=FeedbackResponse)
+async def get_feedback(answer_id: str):
     try:
-        from shared.feedback_store import async_save_feedback
-        await async_save_feedback(
-            feedback_id=fb.feedback_id,
-            answer_id=fb.answer_id,
-            question_id=fb.question_id,
-            user_id=fb.user_id,
-            rating=fb.rating,
-            comment=fb.comment,
-        )
-        logger.info(
-            "Feedback saved feedback_id=%s answer_id=%s rating=%d",
-            fb.feedback_id, fb.answer_id, fb.rating,
-        )
-    except Exception as exc:
-        logger.error("Feedback save failed: %s", exc, exc_info=True)
-        return Response(
-            content=json.dumps({"error": "Failed to save feedback. Please try again."}),
-            status_code=500,
-            media_type="application/json",
-        )
+        doc = await asyncio.to_thread(_get_feedback_by_answer, answer_id)
+    except CosmosHttpResponseError as exc:
+        logger.error("cosmos feedback read error: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not read feedback from Cosmos DB.")
 
-    return Response(
-        content=json.dumps({
-            "status":      "saved",
-            "feedback_id": fb.feedback_id,
-        }),
-        media_type="application/json",
-    )
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No feedback for answer_id={answer_id}.")
 
-
-@app.get("/history/{conversation_id}")
-async def history(conversation_id: str, limit: int = 10) -> Response:
-    """
-    GET /history/{conversation_id}?limit=10
-    Returns the last `limit` turns for the conversation, oldest first.
-    """
-    limit = max(1, min(limit, 50))   # clamp to sane range
-    try:
-        from shared.conversation_store import async_get_history
-        turns = await async_get_history(conversation_id, limit=limit)
-    except Exception as exc:
-        logger.error("History fetch failed: %s", exc, exc_info=True)
-        turns = []
-
-    return Response(
-        content=json.dumps({
-            "conversation_id": conversation_id,
-            "turns":           turns,
-            "count":           len(turns),
-        }),
-        media_type="application/json",
-    )
-
-
-@app.get("/memory/{user_id}")
-async def get_memory(user_id: str) -> Response:
-    """
-    GET /memory/{user_id}
-    Returns all long-term memory records for a user.
-    """
-    try:
-        from shared.memory_store import get_long_term
-        memories = await asyncio.to_thread(get_long_term, user_id)
-    except Exception as exc:
-        logger.error("Memory fetch failed: %s", exc, exc_info=True)
-        memories = []
-
-    return Response(
-        content=json.dumps({
-            "user_id":  user_id,
-            "memories": memories,
-            "count":    len(memories),
-        }),
-        media_type="application/json",
-    )
+    return FeedbackResponse(**doc)
 
 
 if __name__ == "__main__":
