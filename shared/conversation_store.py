@@ -5,8 +5,8 @@ Read / write conversation turns to the Cosmos DB `conversations` container.
 
 Each document (turn) shape:
 {
-    "id":              "<question_id>",          # Cosmos item id (unique)
-    "conversation_id": "conv-abc123",            # partition key
+    "id":              "<question_id>",
+    "conversation_id": "conv-abc123",       # partition key
     "user_id":         "user-xyz",
     "question_id":     "q-abc123",
     "answer_id":       "ans-def456",
@@ -15,10 +15,17 @@ Each document (turn) shape:
     "domain":          "hr",
     "confidence":      0.92,
     "sources":         [...],
-    "timestamp":       "2024-01-15T10:30:00.000Z"
+    "timestamp":       "2024-01-15T10:30:00.000000+00:00"
 }
 
-Gracefully degrades (returns empty list / no-ops) when Cosmos is not configured.
+IMPORTANT — Cosmos composite index required for ORDER BY timestamp:
+  In Azure Portal → Cosmos DB → your-db → conversations → Settings → Indexing Policy,
+  add a composite index:
+    [{ "path": "/conversation_id", "order": "ascending" },
+     { "path": "/timestamp",       "order": "descending" }]
+  provision_cosmos.py sets this automatically via the management SDK.
+
+Gracefully degrades (returns empty / no-ops) when Cosmos is not configured.
 """
 from __future__ import annotations
 
@@ -31,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_container():
-    """Lazily resolve container. Returns None if Cosmos is not configured."""
+    """Lazily resolve container. Returns None if Cosmos not configured."""
     try:
         from shared.azure_clients import get_cosmos_database
         from shared.config import settings
@@ -82,7 +89,6 @@ def save_turn(
         container.upsert_item(item)
         logger.debug("conversation_store: saved turn question_id=%s", question_id)
     except Exception as exc:
-        # Non-fatal — log and continue. A storage failure must not break the answer path.
         logger.error("conversation_store: failed to save turn %s: %s", question_id, exc)
 
 
@@ -90,23 +96,31 @@ def get_history(conversation_id: str, limit: int = 10) -> list[dict]:
     """
     Return the last `limit` turns for a conversation, oldest first.
     Sync — call via asyncio.to_thread from async code.
+
+    NOTE: Requires composite index on (conversation_id ASC, timestamp DESC).
+    Without it Cosmos raises a 400. provision_cosmos.py sets this automatically.
+    Falls back gracefully to an empty list on any error.
     """
     container = _get_container()
     if container is None:
         return []
 
     try:
-        query = (
-            "SELECT c.question_id, c.answer_id, c.query, c.answer, c.domain, "
-            "c.confidence, c.timestamp, c.sources "
+        # Parameterised query — OFFSET/LIMIT values are ints, not user strings
+        sql = (
+            "SELECT c.question_id, c.answer_id, c.query, c.answer, "
+            "c.domain, c.confidence, c.timestamp, c.sources "
             "FROM c "
             "WHERE c.conversation_id = @conv_id "
-            "ORDER BY c.timestamp DESC "
-            f"OFFSET 0 LIMIT {limit}"
+            "ORDER BY c.conversation_id ASC, c.timestamp DESC "
+            "OFFSET 0 LIMIT @limit"
         )
         items = list(container.query_items(
-            query=query,
-            parameters=[{"name": "@conv_id", "value": conversation_id}],
+            query=sql,
+            parameters=[
+                {"name": "@conv_id", "value": conversation_id},
+                {"name": "@limit",   "value": limit},
+            ],
             partition_key=conversation_id,
         ))
         # Reverse so oldest is first (chronological for memory injection)
@@ -132,7 +146,7 @@ async def async_save_turn(
     confidence: float,
     sources: list[dict],
 ) -> None:
-    """Async wrapper around save_turn — fire-and-forget friendly."""
+    """Async wrapper around save_turn."""
     await asyncio.to_thread(
         save_turn,
         question_id, answer_id, conversation_id, user_id,

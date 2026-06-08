@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from agent_framework import step, workflow
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from shared.logging_config import configure_logging, get_logger
 from shared.models import FeedbackRequest, FinalResponse, UserQuery
@@ -101,9 +101,6 @@ async def main_agent_workflow(user_query: UserQuery) -> dict:
                 "sources": [], "domain": None, "attempts_used": 0}
 
     if final.status == "success":
-        # ── Side-effects: Cosmos persistence (fire-and-forget) ──
-        asyncio.create_task(_persist_turn(user_query, final))
-
         return {
             "status":        "success",
             "reply":         final.answer,
@@ -112,6 +109,8 @@ async def main_agent_workflow(user_query: UserQuery) -> dict:
             "sources":       final.sources,
             "domain":        str(final.domain).upper() if final.domain else None,
             "attempts_used": final.attempts_used,
+            # carry FinalResponse for persistence — stripped before JSON response
+            "_final":        final,
         }
 
     return {"status": "failure", "reply": _FAILURE_MSG,
@@ -121,13 +120,12 @@ async def main_agent_workflow(user_query: UserQuery) -> dict:
 
 async def _persist_turn(user_query: UserQuery, final: FinalResponse) -> None:
     """
-    Saves conversation turn + triggers long-term memory extraction.
-    Runs as a background task — any failure is logged but never surfaced to the user.
+    Saves conversation turn + extracts long-term memory facts.
+    Runs as a FastAPI BackgroundTask after the response is sent.
+    Any failure is logged but never surfaced to the user.
     """
     try:
         from shared.conversation_store import async_save_turn
-        from shared.memory_store import async_extract_and_save_long_term
-
         await async_save_turn(
             question_id=user_query.question_id,
             answer_id=final.answer_id,
@@ -139,24 +137,39 @@ async def _persist_turn(user_query: UserQuery, final: FinalResponse) -> None:
             confidence=final.confidence,
             sources=final.sources,
         )
+    except Exception as exc:
+        logger.warning("_persist_turn: save_turn failed (non-fatal): %s", exc)
 
-        # Long-term memory extraction is genuinely fire-and-forget
-        asyncio.create_task(
-            async_extract_and_save_long_term(
-                user_id=user_query.user_id,
-                query=user_query.text,
-                answer=final.answer,
-                source_question_id=user_query.question_id,
-            )
+    # Memory extraction runs sequentially after turn save — we're already
+    # in a background task so no need for another create_task layer.
+    try:
+        from shared.memory_store import async_extract_and_save_long_term
+        await async_extract_and_save_long_term(
+            user_id=user_query.user_id,
+            query=user_query.text,
+            answer=final.answer,
+            source_question_id=user_query.question_id,
         )
     except Exception as exc:
-        logger.warning("_persist_turn failed (non-fatal): %s", exc)
+        logger.warning("_persist_turn: memory extraction failed (non-fatal): %s", exc)
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Initialise Cosmos DB connection at startup — ensures containers exist
+    # and warms up the lru_cache so first request has no cold-start penalty.
+    try:
+        from shared.azure_clients import get_cosmos_database
+        db = await asyncio.to_thread(get_cosmos_database)
+        if db is not None:
+            logger.info("Main Agent: Cosmos DB initialised — database='%s'", db.id)
+        else:
+            logger.warning("Main Agent: Cosmos DB not configured — storage features disabled.")
+    except Exception as exc:
+        logger.warning("Main Agent: Cosmos DB init failed (non-fatal): %s", exc)
+
     logger.info("Main Agent started.")
     yield
     logger.info("Main Agent stopped.")
@@ -171,8 +184,17 @@ async def health() -> dict:
 
 
 @app.post("/query")
-async def query(raw: Request) -> Response:
+async def query(raw: Request, background_tasks: BackgroundTasks) -> Response:
     body = await raw.json()
+
+    # Validate required field
+    if not body.get("text"):
+        return Response(
+            content=json.dumps({"error": "'text' field is required"}),
+            status_code=400,
+            media_type="application/json",
+        )
+
     user_query = UserQuery(
         text=body["text"],
         conversation_id=body.get("conversation_id", str(uuid.uuid4())),
@@ -182,24 +204,26 @@ async def query(raw: Request) -> Response:
     result_obj = await main_agent_workflow.run(user_query)
     outputs    = result_obj.get_outputs()
 
-    # Workflow returns a dict; fall back to failure shape if something went wrong
     out: dict = outputs[0] if outputs else {
         "status": "failure", "reply": _FAILURE_MSG,
         "answer_id": "", "confidence": None,
         "sources": [], "domain": None, "attempts_used": 0,
     }
 
+    # Cosmos persistence via FastAPI BackgroundTasks — safe regardless of MAF internals
+    # BackgroundTasks runs after the response is sent, in the same event loop.
+    final: FinalResponse | None = out.pop("_final", None)
+    if final is not None:
+        background_tasks.add_task(_persist_turn, user_query, final)
+
     return Response(
         content=json.dumps({
-            # ── Identity ──────────────────────────────────────────────
             "question_id":     user_query.question_id,
             "answer_id":       out.get("answer_id", ""),
             "conversation_id": user_query.conversation_id,
             "user_id":         user_query.user_id,
-            # ── Answer ────────────────────────────────────────────────
             "status":          out.get("status", "failure"),
             "reply":           out.get("reply", _FAILURE_MSG),
-            # ── Metadata ──────────────────────────────────────────────
             "domain":          out.get("domain"),
             "confidence":      out.get("confidence"),
             "attempts_used":   out.get("attempts_used", 0),

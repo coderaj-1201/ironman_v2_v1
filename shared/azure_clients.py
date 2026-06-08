@@ -6,11 +6,12 @@ Auth:
   - AI Search        : API key (no role assignment needed with Contributor access)
   - Cosmos DB        : API key (local dev); Managed Identity in production
 
-lru_cache is fine here — single uvicorn worker in local dev.
+lru_cache on all factories — single uvicorn worker in local dev.
 
 Changes vs original:
   - Added get_cosmos_client() factory.
-  - Added get_cosmos_database() helper that ensures DB + containers exist.
+  - Added get_cosmos_database() — NOW @lru_cache so container-ensure runs once,
+    not on every Cosmos operation (was causing 4 extra round-trips per request).
 """
 from __future__ import annotations
 
@@ -71,9 +72,8 @@ def get_cosmos_client():
     """
     Returns a CosmosClient.
     Local dev: API key auth.
-    Production: swap AzureKeyCredential for DefaultAzureCredential / ManagedIdentityCredential.
-    Returns None and logs a warning if Cosmos is not configured (optional for local dev
-    without Cosmos — agents degrade gracefully).
+    Production: swap key credential for DefaultAzureCredential / ManagedIdentityCredential.
+    Returns None (and logs a warning) if Cosmos is not configured — agents degrade gracefully.
     """
     try:
         from azure.cosmos import CosmosClient  # type: ignore[import]
@@ -91,14 +91,16 @@ def get_cosmos_client():
         return None
 
 
+@lru_cache(maxsize=1)
 def get_cosmos_database():
     """
-    Returns the Cosmos database client, creating it if it doesn't exist.
-    Also ensures all three containers exist with correct partition keys and TTL.
+    Returns the Cosmos DatabaseProxy, creating DB + containers if they don't exist.
+    @lru_cache ensures the create_if_not_exists calls run ONCE per process,
+    not on every Cosmos read/write operation.
     Returns None if Cosmos is not configured.
     """
     try:
-        from azure.cosmos import PartitionKey, exceptions  # type: ignore[import]
+        from azure.cosmos import PartitionKey  # type: ignore[import]
     except ImportError:
         return None
 
@@ -113,35 +115,33 @@ def get_cosmos_database():
         logger.error("Failed to get/create Cosmos database '%s': %s", db_name, exc)
         return None
 
-    # conversations — partition by conversation_id for efficient history reads
+    # Ensure containers exist — runs once per process lifecycle
     _ensure_container(
         db,
         name=settings.AZURE_COSMOS_CONTAINER_CONVERSATIONS,
         partition_key="/conversation_id",
-        default_ttl=None,         # keep indefinitely
+        default_ttl=None,
     )
-    # feedback — partition by user_id
     _ensure_container(
         db,
         name=settings.AZURE_COSMOS_CONTAINER_FEEDBACK,
         partition_key="/user_id",
         default_ttl=None,
     )
-    # memory — partition by user_id; short-term items carry their own ttl field
     _ensure_container(
         db,
         name=settings.AZURE_COSMOS_CONTAINER_MEMORY,
         partition_key="/user_id",
-        default_ttl=-1,           # -1 = no default TTL; items set their own via 'ttl' field
+        default_ttl=-1,   # items control their own TTL via 'ttl' field
     )
     return db
 
 
 def _ensure_container(db, name: str, partition_key: str, default_ttl):
-    """Creates the container if it doesn't exist. Silently skips if already there."""
+    """Creates the container if it doesn't exist."""
     try:
         from azure.cosmos import PartitionKey  # type: ignore[import]
-        kwargs = dict(id=name, partition_key=PartitionKey(path=partition_key))
+        kwargs: dict = dict(id=name, partition_key=PartitionKey(path=partition_key))
         if default_ttl is not None:
             kwargs["default_ttl"] = default_ttl
         db.create_container_if_not_exists(**kwargs)

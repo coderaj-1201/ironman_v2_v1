@@ -5,27 +5,25 @@ Short-term and long-term memory for the RAG pipeline.
 
 SHORT-TERM MEMORY
 -----------------
-Derived from the `conversations` container — no separate store needed.
-get_short_term_context() queries the last K turns and formats them as a
-readable conversation history string to inject into the synthesis prompt.
+Derived from the `conversations` container — no separate store.
+get_short_term_context() returns the last K turns as a formatted string
+for injection into the synthesis prompt.
 
 LONG-TERM MEMORY
 ----------------
-Stored in the `memory` container.
-Each document shape:
+Stored in the `memory` container. Schema:
 {
-    "id":          "<memory_id>",     # Cosmos item id
-    "memory_id":   "mem-abc123",
-    "user_id":     "user-xyz",        # partition key
-    "content":     "User prefers answers in bullet points.",
-    "memory_type": "long",
-    "created_at":  "2024-01-15T10:30:00.000Z",
-    "source_question_id": "q-abc123"  # traceability
+    "id":                 "<memory_id>",
+    "memory_id":          "mem-abc123",
+    "user_id":            "user-xyz",      # partition key
+    "content":            "User is in the HR department.",
+    "memory_type":        "long",
+    "created_at":         "2024-01-15T10:30:00.000000+00:00",
+    "source_question_id": "q-abc123"
 }
 
-extract_and_save_long_term() calls the LLM to extract saveable facts from
-an exchange. It is designed to be fire-and-forget (non-blocking) — failures
-do not affect the answer path.
+extract_facts_from_exchange() prompts the LLM to extract user-specific facts.
+Designed to be fire-and-forget — failures never block the answer path.
 
 Gracefully degrades when Cosmos is not configured.
 """
@@ -41,29 +39,31 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 # ── Long-term extraction prompt ───────────────────────────────────────────────
-_EXTRACT_SYSTEM = """You are a memory extraction assistant.
-Given a user question and an assistant answer from an enterprise knowledge system,
-extract any reusable facts, preferences, or context about THIS SPECIFIC USER
-that would be helpful to remember for future queries.
+# NOTE: We use a plain completion (no response_format=json_object) here because
+# json_object mode requires the model to return a JSON *object* (dict), not an
+# array. Asking for an array with json_object mode causes the model to wrap it,
+# which we then have to unwrap. Instead we parse manually and fall back safely.
+_EXTRACT_SYSTEM = """You are a memory extraction assistant for an enterprise knowledge system.
+Given a user question and assistant answer, extract any reusable facts or preferences
+about THIS SPECIFIC USER that would help answer future queries.
 
 Rules:
-- Only extract facts that are clearly about the user (e.g. their role, department, preferences).
-- Do NOT extract general knowledge facts from the answer.
-- Return a JSON array of short strings (each < 100 chars). Return [] if nothing to extract.
-- No markdown, no explanation.
+- Only extract facts clearly about the user (role, department, location, preferences).
+- Do NOT extract general knowledge facts from the answer content.
+- Return ONLY a raw JSON array of short strings (each under 100 chars).
+- If nothing to extract, return exactly: []
+- No markdown fences, no keys, no explanation — just the array.
 
-Example output: ["User is in the HR department", "User prefers concise bullet-point answers"]
-"""
+Example: ["User works in the HR department", "User prefers bullet-point summaries"]"""
 
 
 # ── Short-term memory ─────────────────────────────────────────────────────────
 
 def get_short_term_context(conversation_id: str, k: int | None = None) -> str:
     """
-    Returns the last k turns for a conversation as a formatted string.
-    Intended to be prepended to the synthesis prompt.
-    Sync — call via asyncio.to_thread.
+    Returns the last k turns as a formatted conversation history string.
     Returns empty string if no history or Cosmos unavailable.
+    Sync — call via asyncio.to_thread.
     """
     from shared.config import settings
     from shared.conversation_store import get_history
@@ -73,7 +73,7 @@ def get_short_term_context(conversation_id: str, k: int | None = None) -> str:
     if not turns:
         return ""
 
-    lines = ["[Conversation History — most recent turns]"]
+    lines = ["[Conversation history — use this to resolve follow-up questions]"]
     for t in turns:
         lines.append(f"User: {t.get('query', '')}")
         lines.append(f"Assistant: {t.get('answer', '')}")
@@ -81,7 +81,6 @@ def get_short_term_context(conversation_id: str, k: int | None = None) -> str:
 
 
 async def async_get_short_term_context(conversation_id: str, k: int | None = None) -> str:
-    """Async wrapper."""
     return await asyncio.to_thread(get_short_term_context, conversation_id, k)
 
 
@@ -100,11 +99,7 @@ def _get_memory_container():
         return None
 
 
-def save_long_term(
-    user_id: str,
-    content: str,
-    source_question_id: str = "",
-) -> str | None:
+def save_long_term(user_id: str, content: str, source_question_id: str = "") -> str | None:
     """
     Save a long-term memory fact for a user.
     Returns memory_id on success, None on failure.
@@ -127,7 +122,7 @@ def save_long_term(
 
     try:
         container.upsert_item(item)
-        logger.debug("memory_store: saved memory_id=%s user_id=%s", memory_id, user_id)
+        logger.debug("memory_store: saved memory_id=%s user=%s", memory_id, user_id)
         return memory_id
     except Exception as exc:
         logger.error("memory_store: failed to save long-term memory: %s", exc)
@@ -136,22 +131,25 @@ def save_long_term(
 
 def get_long_term(user_id: str) -> list[dict]:
     """
-    Retrieve all long-term memory facts for a user.
-    Returns list of {memory_id, content, created_at}.
+    Retrieve all long-term memory facts for a user, newest first.
     Sync — call via asyncio.to_thread.
+
+    NOTE: Requires composite index on (user_id ASC, created_at DESC).
+    provision_cosmos.py sets this automatically.
     """
     container = _get_memory_container()
     if container is None:
         return []
 
     try:
-        query = (
+        sql = (
             "SELECT c.memory_id, c.content, c.created_at "
-            "FROM c WHERE c.user_id = @user_id "
-            "ORDER BY c.created_at DESC"
+            "FROM c "
+            "WHERE c.user_id = @user_id "
+            "ORDER BY c.user_id ASC, c.created_at DESC"
         )
         items = list(container.query_items(
-            query=query,
+            query=sql,
             parameters=[{"name": "@user_id", "value": user_id}],
             partition_key=user_id,
         ))
@@ -170,7 +168,7 @@ def get_long_term_context(user_id: str) -> str:
     memories = get_long_term(user_id)
     if not memories:
         return ""
-    lines = ["[Known user context from previous sessions]"]
+    lines = ["[Known context about this user from previous sessions]"]
     for m in memories:
         lines.append(f"- {m.get('content', '')}")
     return "\n".join(lines)
@@ -178,9 +176,13 @@ def get_long_term_context(user_id: str) -> str:
 
 def extract_facts_from_exchange(query: str, answer: str) -> list[str]:
     """
-    Ask the LLM to extract saveable user facts from a Q&A exchange.
+    Ask the LLM to extract saveable user-specific facts from a Q&A exchange.
     Returns a list of fact strings (may be empty).
-    Sync — designed to be called in a background thread.
+    Sync — designed to run in a background thread via asyncio.to_thread.
+
+    Uses plain text completion (not response_format=json_object) because the
+    target is a JSON array, and json_object mode requires a dict — causing
+    the model to wrap the array unnecessarily.
     """
     from shared.azure_clients import get_openai_client
     from shared.config import settings
@@ -191,19 +193,33 @@ def extract_facts_from_exchange(query: str, answer: str) -> list[str]:
             model=settings.AZURE_OPENAI_CHAT_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": _EXTRACT_SYSTEM},
-                {"role": "user", "content": f"Question: {query}\n\nAnswer: {answer}"},
+                {"role": "user",   "content": f"Question: {query}\n\nAnswer: {answer}"},
             ],
             temperature=0,
             max_tokens=200,
-            response_format={"type": "json_object"},
+            # No response_format=json_object — we want a raw array, not a wrapped dict
         )
-        raw = json.loads(resp.choices[0].message.content)
-        if isinstance(raw, list):
-            return [str(f) for f in raw if f]
-        # Model may wrap in a key
-        for v in raw.values():
-            if isinstance(v, list):
-                return [str(f) for f in v if f]
+        raw_text = resp.choices[0].message.content.strip()
+
+        # Strip markdown fences if model adds them despite instructions
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
+
+        parsed = json.loads(raw_text)
+
+        # Accept either a bare array or a wrapped {"facts": [...]} dict
+        if isinstance(parsed, list):
+            return [str(f) for f in parsed if f and len(str(f)) < 200]
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return [str(f) for f in v if f and len(str(f)) < 200]
+        return []
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.debug("memory_store: fact extraction parse error (non-fatal): %s", exc)
         return []
     except Exception as exc:
         logger.warning("memory_store: fact extraction failed: %s", exc)
@@ -218,7 +234,7 @@ async def async_extract_and_save_long_term(
 ) -> None:
     """
     Fire-and-forget: extract facts from an exchange and persist them.
-    Any exception is caught — this must never block the answer path.
+    Any exception is caught — this must never affect the answer path.
     """
     try:
         facts = await asyncio.to_thread(extract_facts_from_exchange, query, answer)
@@ -226,12 +242,11 @@ async def async_extract_and_save_long_term(
             await asyncio.to_thread(save_long_term, user_id, fact, source_question_id)
         if facts:
             logger.info(
-                "memory_store: saved %d long-term facts for user %s", len(facts), user_id
+                "memory_store: saved %d long-term facts for user=%s", len(facts), user_id
             )
     except Exception as exc:
         logger.warning("memory_store: async_extract_and_save_long_term failed: %s", exc)
 
 
 async def async_get_long_term_context(user_id: str) -> str:
-    """Async wrapper."""
     return await asyncio.to_thread(get_long_term_context, user_id)
